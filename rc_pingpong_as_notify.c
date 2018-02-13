@@ -50,6 +50,7 @@
 #include <time.h>
 
 #include "pingpong.h"
+#include <fcntl.h>
 
 enum {
 	PINGPONG_RECV_WRID = 1,
@@ -377,10 +378,19 @@ static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, unsigned 
 	ctx->inlr_recv = inlr_recv;
 
 	if (use_event) {
+		int flags, rc;
+
 		ctx->channel = ibv_create_comp_channel(ctx->context);
 		if (!ctx->channel) {
 			fprintf(stderr, "Couldn't create completion channel\n");
 			goto clean_device;
+		}
+
+		flags = fcntl(ctx->channel->fd, F_GETFL);
+		rc = fcntl(ctx->channel->fd, F_SETFL, flags | O_NONBLOCK);
+		if (rc < 0) {
+			fprintf(stderr, "Failed to change file descriptor of Completion Event Channel\n");
+			goto clean_comp_channel;
 		}
 	} else
 		ctx->channel = NULL;
@@ -515,8 +525,16 @@ static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, unsigned 
 		}
 	}
 
-	ctx->cq = ibv_create_cq(ctx->context, rx_depth + 1, NULL,
+	if (use_event) {
+		struct ibv_exp_cq_init_attr attr;
+		memset(&attr, 0, sizeof(attr));
+		attr.comp_mask = IBV_EXP_CQ_INIT_ATTR_FLAGS;
+		attr.flags = IBV_EXP_CQ_AS_NOTIFY;
+		ctx->cq = ibv_exp_create_cq(ctx->context, rx_depth + 1, NULL, ctx->channel, 0, &attr);
+	} else
+		ctx->cq = ibv_create_cq(ctx->context, rx_depth + 1, NULL,
 				ctx->channel, 0);
+
 	if (!ctx->cq) {
 		fprintf(stderr, "Couldn't create CQ\n");
 		goto clean_mr;
@@ -783,13 +801,13 @@ int main(int argc, char *argv[])
 	int                      use_event = 0;
 	int                      routs;
 	int                      rcnt, scnt;
-	int                      num_cq_events = 0;
 	int                      sl = 0;
 	int			 gidx = -1;
 	char			 gid[INET6_ADDRSTRLEN];
 	int                      inlr_recv = 0;
 	int			 check_nop = 0;
 	int			 err;
+	int			 ne;
 
 	srand48(getpid() * time(NULL));
 	contig_addr = NULL;
@@ -1039,23 +1057,25 @@ int main(int argc, char *argv[])
 	}
 
 	rcnt = scnt = 0;
+	ne = 1;
 	while (rcnt < iters || scnt < iters) {
 		if (use_event) {
-			struct ibv_cq *ev_cq;
-			void          *ev_ctx;
+			asm volatile ("wait");
 
-			if (ibv_get_cq_event(ctx->channel, &ev_cq, &ev_ctx)) {
-				fprintf(stderr, "Failed to get cq_event\n");
-				return 1;
+			if (!ne) {
+				struct ibv_cq *ev_cq;
+				void          *ev_ctx;
+
+				if (ibv_get_cq_event(ctx->channel, &ev_cq, &ev_ctx))
+					goto arm_cq;
+
+				if (ev_cq != ctx->cq) {
+					fprintf(stderr, "CQ event for unknown CQ %p\n", ev_cq);
+					return 1;
+				}
 			}
 
-			++num_cq_events;
-
-			if (ev_cq != ctx->cq) {
-				fprintf(stderr, "CQ event for unknown CQ %p\n", ev_cq);
-				return 1;
-			}
-
+arm_cq:
 			if (ibv_req_notify_cq(ctx->cq, 0)) {
 				fprintf(stderr, "Couldn't request CQ notification\n");
 				return 1;
@@ -1064,7 +1084,7 @@ int main(int argc, char *argv[])
 
 		{
 			struct ibv_exp_wc wc[2];
-			int ne, i;
+			int i;
 
 			do {
 				ne = ibv_exp_poll_cq(ctx->cq, 2, wc, sizeof(wc[0]));
@@ -1135,8 +1155,6 @@ int main(int argc, char *argv[])
 		printf("%d iters in %.2f seconds = %.2f usec/iter\n",
 		       iters, usec / 1000000., usec / iters);
 	}
-
-	ibv_ack_cq_events(ctx->cq, num_cq_events);
 
 	if (pp_close_ctx(ctx))
 		return 1;

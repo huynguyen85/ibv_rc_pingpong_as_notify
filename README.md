@@ -8,6 +8,10 @@ This tool is reusing the existing ibv_rc_pingpong. The only difference
 is with option "-e", the as_notify interrupt is used instead of the
 MSI interrupt.
 
+Example:
+ibv_rc_pingpong_as_notify -d mlx5_0 -e -n 10000000
+ibv_rc_pingpong_as_notify -d mlx5_1 -e -n 10000000 localhost
+
 Supported OS
 ------------
 
